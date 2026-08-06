@@ -1,0 +1,73 @@
+# =============================================================================
+# traefik/dynamic.yml — Configuration dynamique Traefik pour Repod
+#
+# Routes, services amont, middlewares et certificat TLS — équivalent
+# fonctionnel de nginx/tls-proxy.conf. Rechargé à chaud par Traefik
+# (providers.file.watch=true dans traefik.yml), pas besoin de redémarrer
+# le conteneur après une modification.
+#
+# `frontend-ui`/`backend-api` sont résolus via le DNS interne Docker, sur
+# le réseau `repod_network` (le conteneur traefik doit y être attaché —
+# voir docker-compose.traefik.yml).
+# =============================================================================
+
+http:
+  routers:
+    # ── UI de gestion + API (proxée par le frontend) — :443 ──────────────────
+    repod-ui:
+      rule: "PathPrefix(`/`)"
+      entryPoints: ["websecure"]
+      service: repod-ui
+      tls: {}
+      middlewares: ["repod-security-headers"]
+
+    # ── API directe — :8443 (CI/CD, Prometheus) ──────────────────────────────
+    repod-api:
+      rule: "PathPrefix(`/`)"
+      entryPoints: ["backendapi"]
+      service: repod-api
+      tls: {}
+      middlewares: ["repod-security-headers-api"]
+
+  services:
+    repod-ui:
+      loadBalancer:
+        servers:
+          - url: "http://frontend-ui:80"
+    repod-api:
+      loadBalancer:
+        servers:
+          - url: "http://backend-api:8000"
+
+  middlewares:
+    # HSTS 2 ans + en-têtes de sécurité — mêmes valeurs que nginx/tls-proxy.conf
+    repod-security-headers:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: false   # ne pas activer sans domaine public enregistré (voir nginx/tls-proxy.conf)
+        contentTypeNosniff: true
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customResponseHeaders:
+          Permissions-Policy: "camera=(), microphone=(), geolocation=(), payment=()"
+
+    repod-security-headers-api:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        contentTypeNosniff: true
+        customFrameOptionsValue: "DENY"
+
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/cert.pem
+        keyFile: /certs/key.pem
+  options:
+    default:
+      minVersion: VersionTLS12
+      # Go 1.22+ (image Traefik officielle) ne propose déjà que des suites
+      # AEAD/PFS pour TLS 1.2+ par défaut — pas de liste de ciphers à
+      # maintenir à la main comme dans nginx/tls-proxy.conf.

@@ -1,0 +1,80 @@
+# =============================================================================
+# docker-compose.traefik.yml — Overlay reverse proxy Traefik pour Repod
+#
+# Alternative à docker-compose.tls.yml (même rôle : terminaison TLS devant
+# frontend-ui/backend-api) — NE PAS charger les deux en même temps, ils se
+# disputeraient les ports 80/443/8443 sur l'hôte.
+#
+# Usage (certificat auto-signé — par défaut) :
+#   bash scripts/gen-selfsigned-certs.sh
+#   docker compose -f docker-compose.yaml -f docker-compose.traefik.yml up -d
+#
+# Pour Let's Encrypt : voir le bloc commenté dans traefik/traefik.yml et
+# dans traefik/dynamic.yml (routeur repod-ui) — Traefik gère l'ACME
+# nativement, pas de conteneur certbot séparé requis.
+#
+# Choix architectural important : ce fichier utilise le provider FILE de
+# Traefik (traefik/dynamic.yml), pas le provider Docker (labels). Le
+# provider Docker exige de monter /var/run/docker.sock dans le conteneur
+# Traefik — ce projet évite ce montage partout ailleurs (voir CLAUDE.md,
+# sections HA / registre OCI) car un accès au socket permet de contrôler
+# tous les conteneurs de l'hôte, y compris les données d'autres tenants en
+# mode SaaS. Contrepartie assumée : ajouter un nouveau service à exposer
+# demande une entrée manuelle dans traefik/dynamic.yml (rechargée à chaud,
+# sans redémarrage), au lieu d'un simple label — même niveau d'effort que
+# nginx/tls-proxy.conf aujourd'hui, pas une régression.
+#
+# Architecture :
+#   traefik (:80, :443, :8443) → frontend-ui (:80) → backend-api (:8000)
+#   Les ports 3003 et 8000 restent accessibles en local (localhost uniquement).
+#   Le port 80 est repris par Traefik — apt-repo se déplace sur APT_TLS_PORT
+#   (8085 par défaut), exactement comme avec docker-compose.tls.yml.
+# =============================================================================
+
+services:
+
+  traefik:
+    image: traefik:v3.1
+    container_name: repod-traefik
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:80:80"
+      - "${BIND_HOST:-0.0.0.0}:443:443"
+      - "${BIND_HOST:-0.0.0.0}:8443:8443"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./repos/certs/tls:/certs:ro
+      # Uniquement nécessaire si Let's Encrypt est activé (voir traefik.yml) :
+      # - ./repos/certs/traefik-acme:/acme
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - repod_network
+
+  # ── APT repo — déplacé sur le port 8085 (port 80 repris par traefik) ───────
+  # Mettre à jour les sources.list clients (remplacer <host> par l'IP/le nom
+  # de domaine de votre serveur, ex. http://192.0.2.10:8085/...) :
+  #   deb [trusted=yes] http://<host>:8085/repos/dists/jammy jammy main
+  apt-repo:
+    ports: !override
+      - "${BIND_HOST:-0.0.0.0}:${APT_TLS_PORT:-8085}:80"
+
+  # ── Restriction du frontend — localhost uniquement derrière le proxy ────────
+  frontend:
+    ports: !override
+      - "127.0.0.1:${FRONTEND_PORT:-3003}:80"
+
+  # ── Restriction du backend — localhost uniquement derrière le proxy ─────────
+  backend:
+    ports: !override
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
