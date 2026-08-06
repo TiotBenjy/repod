@@ -331,6 +331,35 @@ docker compose -f docker-compose.yaml -f docker-compose.tls.yml \
                -f docker-compose.letsencrypt.yml run --rm certbot certonly
 ```
 
+### Alternative: Traefik / Alternative : Traefik
+
+`docker-compose.traefik.yml` is a drop-in alternative to `docker-compose.tls.yml`
+above — same role (TLS termination in front of `frontend-ui`/`backend-api`),
+same ports, same self-signed-by-default behavior. **Never load both overlays
+together** — they'd fight over ports 80/443/8443.
+
+```bash
+bash scripts/gen-selfsigned-certs.sh
+docker compose -f docker-compose.yaml -f docker-compose.traefik.yml up -d
+```
+
+`docker-compose.traefik.yml` est une alternative interchangeable à
+`docker-compose.tls.yml` ci-dessus — même rôle (terminaison TLS devant
+`frontend-ui`/`backend-api`), mêmes ports, même certificat auto-signé par
+défaut. **Ne jamais charger les deux overlays ensemble** — ils se
+disputeraient les ports 80/443/8443.
+
+It uses Traefik's *file* provider (`traefik/dynamic.yml`), not its Docker
+label provider — the latter needs `/var/run/docker.sock` mounted into the
+proxy container, which this project avoids everywhere. Let's Encrypt is
+supported natively (see the commented block in `traefik/traefik.yml`) — no
+separate Certbot container needed, unlike the Nginx path above. Adding a new
+route means editing `traefik/dynamic.yml` (hot-reloaded, no restart needed)
+instead of adding a label. If you already run your own Traefik instance and
+want Repod to sit behind it instead, skip this overlay entirely — start
+Repod with the base `docker-compose.yaml` only and point your own Traefik's
+dynamic config at `http://<repod-host>:3003`.
+
 ---
 
 ## Environment variables / Variables d'environnement
