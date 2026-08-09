@@ -12,7 +12,7 @@ Architecture :
 
 Concurrence par format :
   - APT : semaphore(2)  — téléchargement Packages.gz (< 20 Mo chacun)
-  - RPM : semaphore(1)  — streaming primary.xml.gz (jusqu'à 600 Mo par source)
+  - RPM : semaphore(4)  — streaming primary.xml.gz (jusqu'à 600 Mo par source)
   - APK : semaphore(3)  — APKINDEX.tar.gz très légers (< 2 Mo)
 """
 import threading
@@ -100,8 +100,9 @@ class SyncJob:
 class SyncManager:
     """Singleton gérant tous les jobs de synchronisation."""
 
-    # Concurrence par format (nombre de sources en parallèle)
-    _CONCURRENCY = {"apt": 2, "rpm": 1, "apk": 3}
+    # Concurrence par format (nombre de sources en parallèle), voir le
+    # docstring du module pour le raisonnement derrière chaque valeur.
+    _CONCURRENCY = {"apt": 2, "rpm": 4, "apk": 3}
 
     def __init__(self):
         self._jobs: Dict[str, SyncJob] = {}
