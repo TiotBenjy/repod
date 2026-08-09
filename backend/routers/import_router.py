@@ -207,8 +207,23 @@ def batch_import(
 
 @router.get("/sync-status")
 def get_status(current_user: str = Depends(get_current_user)):
-    """Retourne le statut de synchronisation de chaque source (APT + RPM + APK)."""
-    return {"sources": get_sync_status()}
+    """
+    Retourne le statut de synchronisation de chaque source (APT + RPM + APK).
+
+    Chaque entrée porte `enabled` : une source désactivée dans les paramètres
+    est exclue de tous les jobs de sync (voir SyncManager.start_job), donc
+    n'obtient jamais de last_sync. Sans ce champ, l'UI ne pouvait pas
+    distinguer "désactivée, donc normalement jamais synchronisée" de "activée
+    mais en retard", et une seule source désactivée suffisait à figer le
+    bandeau de fraîcheur sur "jamais synchronisé" de façon permanente,
+    puisqu'il retient la plus ancienne last_sync de toutes les sources.
+    """
+    return {
+        "sources": [
+            {**s, "enabled": is_source_enabled(s["source_id"])}
+            for s in get_sync_status()
+        ]
+    }
 
 
 # ─── Jobs de synchronisation en arrière-plan ─────────────────────────────────
