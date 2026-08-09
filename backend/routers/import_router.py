@@ -214,7 +214,7 @@ def get_status(current_user: str = Depends(get_current_user)):
     est exclue de tous les jobs de sync (voir SyncManager.start_job), donc
     n'obtient jamais de last_sync. Sans ce champ, l'UI ne pouvait pas
     distinguer "désactivée, donc normalement jamais synchronisée" de "activée
-    mais en retard", et une seule source désactivée suffisait à figer le
+    mais en retard" — et une seule source désactivée suffisait à figer le
     bandeau de fraîcheur sur "jamais synchronisé" de façon permanente,
     puisqu'il retient la plus ancienne last_sync de toutes les sources.
     """
@@ -240,14 +240,22 @@ def get_status(current_user: str = Depends(get_current_user)):
 def start_sync_all(
     request: Request,
     response: Response,
+    force: bool = Query(False, description="Réindexer même les sources dont l'index amont est inchangé"),
     current_user: str = Depends(get_maintainer_user),
     _leader: None = Depends(require_leader),
 ):
-    """Démarre la synchronisation de toutes les sources en arrière-plan."""
+    """
+    Démarre la synchronisation de toutes les sources en arrière-plan.
+
+    Par défaut, une source dont l'index amont n'a pas bougé depuis la dernière
+    ingestion réussie est sautée (services/index_state.py). `force=true`
+    réindexe tout, utile après une intervention manuelle en base.
+    """
     job = sync_manager.start_job(
         "all",
         user=current_user,
         enabled_filter=is_source_enabled,
+        force=force,
     )
     return {
         "job_id": job.job_id,
@@ -264,12 +272,15 @@ def start_sync_target(
     request: Request,
     response: Response,
     target: str,
+    force: bool = Query(False, description="Réindexer même si l'index amont est inchangé"),
     current_user: str = Depends(get_maintainer_user),
     _leader: None = Depends(require_leader),
 ):
     """
     Démarre la synchronisation d'un groupe ou d'une source spécifique.
     target : apt | rpm | apk | <source_id>
+
+    `force=true` réindexe même les sources dont l'index amont n'a pas bougé.
     """
     valid_groups = {"apt", "rpm", "apk"}
     source_ids = {s["id"] for s in DEFAULT_SOURCES}
@@ -285,6 +296,7 @@ def start_sync_target(
         target,
         user=current_user,
         enabled_filter=is_source_enabled if target in valid_groups else None,
+        force=force,
     )
     return {
         "job_id": job.job_id,
@@ -967,6 +979,7 @@ def delete_import_group(
 @router.post("/sync/{source_id}")
 def sync_one_source(
     source_id: str,
+    force: bool = Query(False, description="Réindexer même si l'index amont est inchangé"),
     current_user: str = Depends(get_maintainer_user),
 ):
     """
@@ -976,7 +989,7 @@ def sync_one_source(
     if not any(s["id"] == source_id for s in DEFAULT_SOURCES):
         raise HTTPException(status_code=404, detail=f"Source '{source_id}' inconnue")
 
-    job = sync_manager.start_job(source_id, user=current_user)
+    job = sync_manager.start_job(source_id, user=current_user, force=force)
     return {
         "job_id": job.job_id,
         "source_id": source_id,

@@ -24,14 +24,17 @@ from typing import Dict, Optional
 class SyncJob:
     """État complet d'un job de synchronisation."""
 
-    def __init__(self, job_id: str, label: str, sources: list, group: str = ""):
+    def __init__(self, job_id: str, label: str, sources: list, group: str = "",
+                 force: bool = False):
         self.job_id = job_id
         self.label = label
         self.group = group  # "all"|"apt"|"rpm"|"apk"|"source:<id>" — voir SyncManager._active_job_for_group()
         self.sources = sources
+        self.force = force           # True : réindexe même les sources inchangées
         self.total = len(sources)
         self.done_count = 0
         self.error_count = 0
+        self.skipped_count = 0       # sources dont l'index amont n'a pas bougé
         self.status = "running"      # "running" | "done" | "error" | "cancelled"
         self.logs: list[str] = []    # format "level|message"
         self.started_at = datetime.now(timezone.utc).isoformat()
@@ -85,6 +88,8 @@ class SyncJob:
             "total":         self.total,
             "done_count":    self.done_count,
             "error_count":   self.error_count,
+            "skipped_count": self.skipped_count,
+            "force":         self.force,
             "started_at":    self.started_at,
             "finished_at":   self.finished_at,
             "log_count":     len(self.logs),
@@ -109,12 +114,14 @@ class SyncManager:
         target: str,
         user: str = "system",
         enabled_filter=None,
+        force: bool = False,
     ) -> SyncJob:
         """
         Démarre un job de sync en arrière-plan.
 
         target : "all" | "apt" | "rpm" | "apk" | <source_id>
         enabled_filter : callable(source_id) → bool pour filtrer les sources actives
+        force : réindexe même les sources dont l'index amont est inchangé
         Retourne le job existant si un job pour ce groupe est déjà actif.
         """
         group = self._target_to_group(target)
@@ -132,7 +139,7 @@ class SyncManager:
             if not sources:
                 # Créer un job vide immédiatement terminé
                 job_id = str(uuid.uuid4())[:8]
-                job = SyncJob(job_id, self._label(target), [], group=group)
+                job = SyncJob(job_id, self._label(target), [], group=group, force=force)
                 job.emit("warning", "Aucune source active pour cette sélection")
                 job.status = "done"
                 job.finished_at = datetime.now(timezone.utc).isoformat()
@@ -140,7 +147,7 @@ class SyncManager:
                 return job
 
             job_id = str(uuid.uuid4())[:8]
-            job = SyncJob(job_id, self._label(target), sources, group=group)
+            job = SyncJob(job_id, self._label(target), sources, group=group, force=force)
             self._jobs[job_id] = job
             self._cleanup_old_jobs()
 
@@ -216,12 +223,13 @@ class SyncManager:
                 job.status = "cancelled"
             elif job.error_count == 0:
                 job.emit("success",
-                         f"✅ Synchronisation terminée — {job.total} source(s)")
+                         f"Synchronisation terminée : {job.total} source(s)"
+                         f"{self._skipped_note(job)}")
                 job.status = "done"
             else:
                 job.emit("warning",
                          f"Synchronisation terminée avec {job.error_count} erreur(s) "
-                         f"sur {job.total} source(s)")
+                         f"sur {job.total} source(s){self._skipped_note(job)}")
                 job.status = "done"
 
             # Audit
@@ -230,6 +238,7 @@ class SyncManager:
                 from services.format_router import FORMAT_LABEL
                 audit_log("SYNC", user, job.status.upper(),
                           detail=f"Sync {FORMAT_LABEL} ({job.total} sources, "
+                                 f"{job.skipped_count} inchangées, "
                                  f"{job.error_count} erreurs)")
             except Exception:
                 pass
@@ -249,12 +258,13 @@ class SyncManager:
         semaphore = threading.Semaphore(concurrency)
         fmt_errors = 0
         cancelled_count = 0
+        skipped_count = 0
         threads_lock = threading.Lock()
 
         job.emit("info", f"📦 {fmt_label} ({len(sources)} source(s))...")
 
         def _sync_one(source):
-            nonlocal fmt_errors, cancelled_count
+            nonlocal fmt_errors, cancelled_count, skipped_count
             with semaphore:
                 if job._stop.is_set():
                     with threads_lock:
@@ -265,9 +275,9 @@ class SyncManager:
                 try:
                     # Passer le stop_event aux sources RPM (qui supportent l'annulation mid-stream)
                     if "repomd_url" in source:
-                        result = sync_fn(source, stop_event=job._stop)
+                        result = sync_fn(source, stop_event=job._stop, force=job.force)
                     else:
-                        result = sync_fn(source)
+                        result = sync_fn(source, force=job.force)
                     with threads_lock:
                         job.done_count += 1
                     status = result.get("status", "error")
@@ -275,6 +285,15 @@ class SyncManager:
                         job.emit(
                             "success",
                             f"  ✅ {source['label']} — {result['pkg_count']:,} paquets",
+                        )
+                    elif status == "skipped":
+                        with threads_lock:
+                            skipped_count += 1
+                            job.skipped_count += 1
+                        job.emit(
+                            "info",
+                            f"  {source['label']} : inchangée "
+                            f"({result['pkg_count']:,} paquets déjà indexés)",
                         )
                     elif status == "cancelled":
                         with threads_lock:
@@ -305,14 +324,23 @@ class SyncManager:
             return  # Le résumé sera fait dans _run_job
 
         ok_count = len(sources) - fmt_errors - cancelled_count
+        skipped_note = f" (dont {skipped_count} inchangée(s))" if skipped_count else ""
         if fmt_errors == 0:
-            job.emit("success", f"  ✅ {fmt_label} : {ok_count}/{len(sources)} OK")
+            job.emit("success",
+                     f"  {fmt_label} : {ok_count}/{len(sources)} OK{skipped_note}")
         else:
             job.emit("warning",
-                     f"  ⚠️ {fmt_label} : {ok_count}/{len(sources)} OK, "
+                     f"  {fmt_label} : {ok_count}/{len(sources)} OK{skipped_note}, "
                      f"{fmt_errors} erreur(s)")
 
     # ─── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _skipped_note(job: SyncJob) -> str:
+        """Suffixe de résumé rendant explicite ce qui n'a pas été réindexé."""
+        if not job.skipped_count:
+            return ""
+        return f", dont {job.skipped_count} inchangée(s) depuis la dernière sync"
 
     @staticmethod
     def _target_to_group(target: str) -> str:

@@ -84,7 +84,7 @@ def db_test_engine():
 
     Tables créées : users, api_tokens, revoked_tokens, manifests, ssh_known_hosts,
                     inventory_clients, inventory_packages, packages, sync_status, sync_log,
-                    import_groups, import_group_files,
+                    source_index_state, import_groups, import_group_files,
                     apk_packages, apk_sync_status.
     """
     from sqlalchemy import create_engine, text as _t
@@ -250,6 +250,13 @@ def db_test_engine():
                 pkg_count  INTEGER DEFAULT 0,
                 status     TEXT DEFAULT 'never',
                 error      TEXT
+            )
+        """))
+        c.execute(_t("""
+            CREATE TABLE source_index_state (
+                source_id   TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
             )
         """))
         c.execute(_t("""

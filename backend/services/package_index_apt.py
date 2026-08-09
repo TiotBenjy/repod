@@ -15,6 +15,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from db.engine import db_conn
+from services import index_state
 from services.http_retry import fetch_url
 
 logger = logging.getLogger("package_index_apt")
@@ -492,38 +493,41 @@ def _verify_inrelease_gpg(inrelease_text: str) -> tuple[bool, str]:
     return True, "Signature GPG InRelease vérifiée"
 
 
-def _verify_packages_via_inrelease(packages_url: str, gz_data: bytes) -> tuple[bool, str]:
+def _authenticated_packages_sha256(packages_url: str) -> tuple[str | None, str]:
     """
-    Vérifie l'authenticité ET l'intégrité de Packages.gz :
+    Retourne (sha256_attendu, message) pour un Packages(.gz/.xz) donné, en
+    n'ayant téléchargé que l'InRelease jamais le Packages lui-même.
+
       1. Télécharge InRelease.
-      2. Vérifie sa signature GPG (_verify_inrelease_gpg) — l'ancre de
+      2. Vérifie sa signature GPG (_verify_inrelease_gpg) : l'ancre de
          confiance réelle, absente jusqu'ici malgré ce que suggérait le nom
-         de cette fonction.
-      3. Une fois InRelease authentifié, compare le SHA256 qu'il déclare
-         pour ce Packages avec celui réellement téléchargé.
+         de _verify_packages_via_inrelease().
+      3. Extrait de cet InRelease authentifié le SHA256 déclaré pour ce
+         Packages précis.
 
-    Chain of trust complète : signature GPG InRelease → SHA256 de
-    Packages.gz → SHA256 de chaque paquet individuel dans Packages.gz.
+    Sur échec, retourne (None, raison) // Toute étape qui échoue (InRelease
+    injoignable, signature invalide, SHA256 absent) fait échouer la
+    synchronisation de la source. Avant ce correctif, une InRelease
+    injoignable ou un SHA256 absent ne produisaient qu'un avertissement et
+    laissaient passer un Packages.gz jamais authentifié. La vérification
+    n'était donc, dans les faits, jamais réellement obligatoire.
 
-    Retourne (ok, message). Si ok=False, le sync de cette source est
-    annulé — toute étape qui échoue (InRelease injoignable, signature
-    invalide, SHA256 absent ou non correspondant) fait désormais échouer
-    la synchronisation. Avant ce correctif, une InRelease injoignable ou
-    un SHA256 absent ne produisaient qu'un avertissement et laissaient
-    passer un Packages.gz jamais authentifié — la vérification n'était
-    donc, dans les faits, jamais réellement obligatoire.
+    Séparée de la comparaison de hash (_verify_packages_via_inrelease) parce
+    que ce SHA256 authentifié est aussi l'empreinte d'index de la source
+    (services/index_state.py) : le connaître avant le téléchargement permet
+    de sauter entièrement une source inchangée.
     """
     try:
         parts = packages_url.split("/dists/")
         if len(parts) != 2:
-            return False, "URL InRelease non dérivable (pas de /dists/ dans l'URL) — vérification impossible"
+            return None, "URL InRelease non dérivable (pas de /dists/ dans l'URL) : vérification impossible"
         base_url = parts[0]
         after_dists = parts[1]
         codename = after_dists.split("/")[0]
         relative_path = "/".join(after_dists.split("/")[1:])
         inrelease_url = f"{base_url}/dists/{codename}/InRelease"
     except Exception as exc:
-        return False, f"Dérivation InRelease URL échouée : {exc}"
+        return None, f"Dérivation InRelease URL échouée : {exc}"
 
     try:
         inrelease_text = fetch_url(
@@ -533,12 +537,12 @@ def _verify_packages_via_inrelease(packages_url: str, gz_data: bytes) -> tuple[b
         ).decode("utf-8", errors="replace")
     except Exception as exc:
         logger.warning("[package_index_apt] InRelease non disponible pour %s : %s", packages_url, exc)
-        return False, f"InRelease injoignable — authenticité de Packages.gz non vérifiable : {exc}"
+        return None, f"InRelease injoignable : authenticité de Packages.gz non vérifiable : {exc}"
 
     gpg_ok, gpg_msg = _verify_inrelease_gpg(inrelease_text)
     if not gpg_ok:
         logger.error("[package_index_apt] Échec vérification GPG InRelease (%s) : %s", inrelease_url, gpg_msg)
-        return False, gpg_msg
+        return None, gpg_msg
 
     expected_sha256: str | None = None
     in_sha256_section = False
@@ -560,18 +564,43 @@ def _verify_packages_via_inrelease(packages_url: str, gz_data: bytes) -> tuple[b
             "[package_index_apt] SHA256 pour '%s' absent de InRelease (%s)",
             relative_path, inrelease_url,
         )
-        return False, f"SHA256 non trouvé dans InRelease (pourtant authentifié) pour {relative_path}"
+        return None, f"SHA256 non trouvé dans InRelease (pourtant authentifié) pour {relative_path}"
+
+    return expected_sha256, f"InRelease authentifiée (GPG) SHA256 attendu : {expected_sha256[:16]}…"
+
+
+def _verify_packages_via_inrelease(packages_url: str, gz_data: bytes) -> tuple[bool, str]:
+    """
+    Vérifie l'authenticité ET l'intégrité d'un Packages(.gz/.xz) déjà
+    téléchargé : SHA256 authentifié via InRelease signée
+    (_authenticated_packages_sha256), puis comparaison avec les octets reçus.
+
+    Chain of trust complète : signature GPG InRelease → SHA256 de
+    Packages.gz => SHA256 de chaque paquet individuel dans Packages.gz.
+
+    Retourne (ok, message). sync_source() n'appelle plus cette fonction. Elle
+    dédouble le téléchargement d'InRelease, inutile puisque le SHA256 attendu
+    y est déjà connu avant le téléchargement. Conservée comme point d'entrée
+    unique pour vérifier un Packages obtenu par un autre chemin.
+    """
+    expected_sha256, msg = _authenticated_packages_sha256(packages_url)
+    if expected_sha256 is None:
+        return False, msg
 
     actual_sha256 = hashlib.sha256(gz_data).hexdigest()
     if actual_sha256 != expected_sha256:
-        return False, (
-            f"SHA256 de Packages.gz invalide — possible attaque MitM ou corruption\n"
-            f"  Attendu (InRelease) : {expected_sha256}\n"
-            f"  Obtenu              : {actual_sha256}\n"
-            f"  Source              : {packages_url}"
-        )
+        return False, _sha256_mismatch_message(packages_url, expected_sha256, actual_sha256)
 
     return True, f"Packages.gz authentifié (GPG InRelease + SHA256 : {actual_sha256[:16]}…)"
+
+
+def _sha256_mismatch_message(packages_url: str, expected: str, actual: str) -> str:
+    return (
+        f"SHA256 de Packages.gz invalide : possible attaque MitM ou corruption\n"
+        f"  Attendu (InRelease) : {expected}\n"
+        f"  Obtenu              : {actual}\n"
+        f"  Source              : {packages_url}"
+    )
 
 
 def _decompress(data: bytes, url: str) -> str:
@@ -686,29 +715,93 @@ def _write_sync_error(source_id: str, label: str, error_msg: str) -> None:
         )
 
 
-def sync_source(source: dict) -> dict:
+def _indexed_pkg_count(source_id: str) -> int:
+    """Nombre de paquets actuellement indexés pour cette source."""
+    try:
+        with db_conn() as conn:
+            return conn.execute(
+                text("SELECT COUNT(*) FROM packages WHERE source_id = :sid"),
+                {"sid": source_id},
+            ).scalar() or 0
+    except Exception:
+        return 0
+
+
+def _touch_sync_status(source_id: str, label: str, pkg_count: int) -> None:
+    """Rafraîchit last_sync sans réécrire l'index (source inchangée)."""
+    with db_conn() as conn:
+        conn.execute(text("""
+            INSERT INTO sync_status (source_id, label, last_sync, pkg_count, status, error)
+            VALUES (:source_id, :label, :last_sync, :pkg_count, 'ok', NULL)
+            ON CONFLICT (source_id) DO UPDATE SET
+                label = EXCLUDED.label,
+                last_sync = EXCLUDED.last_sync,
+                pkg_count = EXCLUDED.pkg_count,
+                status = 'ok',
+                error = NULL
+        """), {
+            "source_id": source_id,
+            "label": label,
+            "last_sync": datetime.now(timezone.utc).isoformat(),
+            "pkg_count": pkg_count,
+        })
+
+
+def sync_source(source: dict, force: bool = False) -> dict:
     """
     Télécharge et indexe Packages.gz pour une source donnée.
     Retourne un résumé du résultat.
 
+    InRelease (quelques centaines de Ko) est récupérée et authentifiée
+    AVANT le Packages.gz : le SHA256 qu'elle déclare est l'empreinte de
+    l'index amont. S'il est identique à celui déjà ingéré, la source est
+    inchangée bit pour bit et on saute le téléchargement, le parsing et la
+    réécriture complète de la table, cas de très loin le plus fréquent hors
+    jour de publication. `force=True` resynchronise inconditionnellement.
+
     Le téléchargement retente jusqu'à 2 fois (backoff 2s/5s) sur un aléa
-    réseau transitoire (timeout, connexion refusée, HTTP 5xx/429) — jamais
+    réseau transitoire (timeout, connexion refusée, HTTP 5xx/429), jamais
     sur un 404/403, qui indique que la source elle-même a un problème
     (déplacée/retirée), pas un incident passager. Voir services/http_retry.py.
     """
     source_id = source["id"]
 
     try:
+        expected_sha256, auth_msg = _authenticated_packages_sha256(source["url"])
+        if expected_sha256 is None:
+            raise ValueError(auth_msg)
+
+        # Skip si l'index amont est identique à celui déjà ingéré. Le garde-fou
+        # sur le comptage évite de sauter une source dont la table a été vidée
+        # par ailleurs (purge manuelle, restauration partielle).
+        if not force and index_state.is_unchanged(source_id, expected_sha256):
+            indexed = _indexed_pkg_count(source_id)
+            if indexed > 0:
+                _touch_sync_status(source_id, source["label"], indexed)
+                logger.info(
+                    "[package_index_apt] %s: index amont inchangé (SHA256 %s…) : sync sautée",
+                    source_id, expected_sha256[:16],
+                )
+                return {
+                    "source_id": source_id,
+                    "label": source["label"],
+                    "status": "skipped",
+                    "pkg_count": indexed,
+                }
+
         gz_data = fetch_url(
             source["url"],
             headers={"User-Agent": "APT-Repo-Manager/2.0"},
             timeout=30,
         )
 
-        ok, msg = _verify_packages_via_inrelease(source["url"], gz_data)
-        if not ok:
-            raise ValueError(msg)
-        logger.info("[package_index_apt] %s: %s", source_id, msg)
+        actual_sha256 = hashlib.sha256(gz_data).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(_sha256_mismatch_message(source["url"], expected_sha256, actual_sha256))
+        logger.info(
+            "[package_index_apt] %s: Packages.gz authentifié (GPG InRelease + SHA256 : %s…)",
+            source_id, actual_sha256[:16],
+        )
 
         packages = _parse_packages_gz(gz_data, source)
 
@@ -721,6 +814,11 @@ def sync_source(source: dict) -> dict:
         for pkg in packages:
             for k, v in _defaults.items():
                 pkg.setdefault(k, v)
+
+        # Effacée AVANT la réécriture : une interruption entre le DELETE et la
+        # fin des INSERT ne doit jamais laisser une empreinte qui prétend que
+        # la base contient un catalogue complet.
+        index_state.clear(source_id)
 
         with db_conn() as conn:
             conn.execute(text("DELETE FROM packages WHERE source_id = :source_id"), {"source_id": source_id})
@@ -748,6 +846,8 @@ def sync_source(source: dict) -> dict:
                 "last_sync": datetime.now(timezone.utc).isoformat(),
                 "pkg_count": len(packages),
             })
+
+        index_state.remember(source_id, expected_sha256)
 
         return {
             "source_id": source_id,
