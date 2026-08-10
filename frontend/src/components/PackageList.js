@@ -22,6 +22,25 @@ function formatStaleness(hours) {
   return `depuis ${Math.max(1, Math.floor(hours))} heure${Math.floor(hours) > 1 ? "s" : ""}`;
 }
 
+/**
+ * Fraîcheur de l'index externe, calculée sur la source la plus en retard.
+ *
+ * Seules les sources activées comptent : une source désactivée est exclue de
+ * tous les jobs de sync côté backend, elle n'a donc jamais de last_sync. Comme
+ * on retient la source la PLUS ancienne, une seule source désactivée suffisait
+ * à figer le bandeau sur "jamais synchronisé" en permanence, quel que soit le
+ * nombre de synchros réussies sur toutes les autres.
+ *
+ * `enabled` absent (backend antérieur à ce correctif) => source comptée, pour ne
+ * pas masquer silencieusement un vrai retard d'index.
+ */
+export function computeIndexStaleness(sources, thresholdHours = SYNC_STALE_THRESHOLD_HOURS) {
+  const tracked = (sources || []).filter((s) => s.enabled !== false);
+  if (tracked.length === 0) return { oldestSyncHours: 0, indexStale: false };
+  const oldestSyncHours = Math.max(...tracked.map((s) => hoursSinceSync(s.last_sync)));
+  return { oldestSyncHours, indexStale: oldestSyncHours > thresholdHours };
+}
+
 const REPO_URL     = getRepoUrl();
 const API_URL      = getApiBaseUrl();
 
@@ -819,10 +838,7 @@ export default function PackageList() {
     if (!hadActive && activeCount === 0) loadSyncStatus();
   }, [activeCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const oldestSyncHours = syncSources.length > 0
-    ? Math.max(...syncSources.map((s) => hoursSinceSync(s.last_sync)))
-    : 0;
-  const indexStale = syncSources.length > 0 && oldestSyncHours > SYNC_STALE_THRESHOLD_HOURS;
+  const { oldestSyncHours, indexStale } = computeIndexStaleness(syncSources);
 
   const handleFreshnessSync = async () => {
     try {

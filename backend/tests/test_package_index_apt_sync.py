@@ -22,8 +22,13 @@ Rôle   : services/package_index_apt.py:sync_source() — seule
 Dépend : pytest, unittest.mock.patch, db_test_engine (fixture conftest.py,
          SQLite in-memory, autouse).
 """
+import hashlib
 import urllib.error
 from unittest.mock import MagicMock, patch
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _source(source_id="ubuntu-jammy"):
@@ -55,7 +60,11 @@ class TestSyncSourcePersistsEveryFailureType:
         """Comportement déjà correct avant le correctif — non-régression.
         Patch time.sleep : sync_source() retente désormais 2 fois sur une
         URLError (services/http_retry.py) avant d'abandonner — sans ce
-        patch, ce test attendrait réellement 2s+5s pour rien."""
+        patch, ce test attendrait réellement 2s+5s pour rien.
+
+        L'URLError frappe ici sur InRelease, désormais téléchargée en premier
+        (avant Packages.gz) pour connaître l'empreinte d'index sans payer le
+        gros téléchargement."""
         import services.package_index_apt as pia
 
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connexion refusée")), \
@@ -69,9 +78,9 @@ class TestSyncSourcePersistsEveryFailureType:
         assert "connexion refusée" in row["error"]
 
     def test_integrity_check_failure_persists_status_error(self, db_test_engine):
-        """C'est le bug corrigé : _verify_packages_via_inrelease() qui
-        échoue lève un ValueError, capturé par la branche générique
-        `except Exception` — avant le correctif, rien n'était écrit."""
+        """C'est le bug corrigé : un échec d'authentification de l'index lève
+        un ValueError, capturé par la branche générique `except Exception` —
+        avant le correctif, rien n'était écrit."""
         import services.package_index_apt as pia
 
         mock_resp = MagicMock()
@@ -79,8 +88,8 @@ class TestSyncSourcePersistsEveryFailureType:
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp), \
-             patch.object(pia, "_verify_packages_via_inrelease",
-                           return_value=(False, "SHA256 invalide — possible attaque MitM")):
+             patch.object(pia, "_authenticated_packages_sha256",
+                           return_value=(None, "SHA256 invalide — possible attaque MitM")):
             result = pia.sync_source(_source())
 
         assert result["status"] == "error"
@@ -99,12 +108,14 @@ class TestSyncSourcePersistsEveryFailureType:
         (ex. Packages.gz corrompu) doit aussi être persisté."""
         import services.package_index_apt as pia
 
+        payload = b"pas du gzip valide"
         mock_resp = MagicMock()
-        mock_resp.read.return_value = b"pas du gzip valide"
+        mock_resp.read.return_value = payload
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp), \
-             patch.object(pia, "_verify_packages_via_inrelease", return_value=(True, "ok")), \
+             patch.object(pia, "_authenticated_packages_sha256",
+                           return_value=(_sha256(payload), "ok")), \
              patch.object(pia, "_parse_packages_gz", side_effect=ValueError("Impossible de décompresser")):
             result = pia.sync_source(_source())
 
@@ -135,12 +146,14 @@ class TestSyncSourcePersistsEveryFailureType:
         """Non-régression du chemin nominal (inchangé par le correctif)."""
         import services.package_index_apt as pia
 
+        payload = b"contenu"
         mock_resp = MagicMock()
-        mock_resp.read.return_value = b"contenu"
+        mock_resp.read.return_value = payload
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp), \
-             patch.object(pia, "_verify_packages_via_inrelease", return_value=(True, "ok")), \
+             patch.object(pia, "_authenticated_packages_sha256",
+                           return_value=(_sha256(payload), "ok")), \
              patch.object(pia, "_parse_packages_gz", return_value=[]):
             result = pia.sync_source(_source())
 
@@ -148,6 +161,27 @@ class TestSyncSourcePersistsEveryFailureType:
         row = _sync_status_row("ubuntu-jammy")
         assert row["status"] == "ok"
         assert row["error"] is None
+
+    def test_tampered_packages_gz_is_rejected(self, db_test_engine):
+        """Le SHA256 authentifié via InRelease doit toujours être confronté aux
+        octets réellement reçus. Le skip d'index inchangé ne doit pas devenir
+        une porte dérobée : un Packages.gz qui ne correspond pas au hash
+        annoncé fait échouer la sync, comme avant."""
+        import services.package_index_apt as pia
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"charge utile falsifiee"
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp), \
+             patch.object(pia, "_authenticated_packages_sha256",
+                           return_value=(_sha256(b"le vrai contenu"), "ok")), \
+             patch.object(pia, "_parse_packages_gz", return_value=[]) as mock_parse:
+            result = pia.sync_source(_source())
+
+        assert result["status"] == "error"
+        assert "MitM" in result["error"]
+        mock_parse.assert_not_called(), "le contenu falsifié n'aurait jamais dû être parsé"
 
     def test_write_sync_error_itself_never_raises(self, db_test_engine):
         """_write_sync_error() est appelée depuis un bloc except — si la

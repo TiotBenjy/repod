@@ -264,9 +264,9 @@ function SyncTab() {
     if (!hadActive && activeCount === 0) loadStatus();
   }, [activeCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleSync = async (target) => {
+  const handleSync = async (target, { force = false } = {}) => {
     try {
-      const data = await startSync(target);
+      const data = await startSync(target, { force });
       setJobPanels(prev => ({ ...prev, [target]: data.job_id }));
       // Pour les syncs de source individuelle, mettre à jour aussi la clé source
       if (target !== "all" && target !== "apt" && target !== "rpm" && target !== "apk") {
@@ -416,11 +416,14 @@ function SyncTab() {
                     <td className="px-4 py-2.5 text-right">
                       <button
                         onClick={() => {
-                          handleSync(s.source_id);
+                          // force : cliquer sur une source précise est une demande
+                          // explicite de réindexation, pas un simple "vérifie si ça a bougé"
+                          // sinon le bouton ne ferait rien de visible sur une source déjà à jour.
+                          handleSync(s.source_id, { force: true });
                           setJobPanels(prev => ({...prev, [s.source_id]: "__pending__"}));
                         }}
                         disabled={srcRunning}
-                        title="Synchroniser cette source"
+                        title="Resynchroniser cette source (réindexation complète)"
                         className="p-1 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 disabled:opacity-30 transition-colors"
                       >
                         <SyncIcon spinning={srcRunning} />

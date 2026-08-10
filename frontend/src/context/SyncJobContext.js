@@ -87,12 +87,16 @@ export function SyncJobProvider({ children }) {
   /**
    * Démarre un job de sync.
    * target : "all" | "apt" | "rpm" | "apk" | <source_id>
+   * force=true réindexe même les sources dont l'index amont est inchangé
+   * réservé aux resyncs ciblées explicites (bouton d'une source précise), une
+   * sync globale doit rester incrémentale.
    * Retourne { job_id, label, status }
    */
-  const startSync = useCallback(async (target = "all") => {
-    const path = target === "all"
+  const startSync = useCallback(async (target = "all", { force = false } = {}) => {
+    const base = target === "all"
       ? "/import/sync/start"
       : `/import/sync/start/${target}`;
+    const path = force ? `${base}?force=true` : base;
     const data = await apiFetch(path, { method: "POST" });
     jobTargetRef.current[data.job_id] = target;
     // Forcer un poll immédiat

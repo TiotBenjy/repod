@@ -24,6 +24,7 @@ Interface compatible avec package_index_apt.py :
   DEFAULT_SOURCES, sync_source, sync_all, get_sync_status, is_indexed,
   search_packages, get_package_info, init_db
 """
+import hashlib
 import io
 import logging
 import os
@@ -38,6 +39,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from db.engine import db_conn
+from services import index_state
 from services.http_retry import fetch_url
 
 logger = logging.getLogger("package_index_apk")
@@ -367,20 +369,24 @@ def _verify_apkindex_signature(gz_data: bytes) -> tuple[bool, str]:
     return True, ""
 
 
-def _download_and_parse(apkindex_url: str, source: dict) -> list[dict]:
+def _fetch_apkindex(apkindex_url: str) -> bytes:
     """
-    Télécharge APKINDEX.tar.gz, authentifie sa signature RSA, extrait le
-    fichier APKINDEX et le parse. Retourne la liste des paquets.
+    Télécharge APKINDEX.tar.gz brut, sans le vérifier ni le parser.
 
-    Retente jusqu'à 2 fois (backoff 2s/5s) sur un aléa réseau transitoire —
-    voir services/http_retry.py.
+    Retente jusqu'à 2 fois (backoff 2s/5s) sur un aléa réseau transitoire, voir services/http_retry.py.
     """
-    gz_data = fetch_url(
+    return fetch_url(
         apkindex_url,
         headers={"User-Agent": "APK-Repo-Manager/1.0"},
         timeout=60,
     )
 
+
+def _verify_and_parse(gz_data: bytes, source: dict) -> list[dict]:
+    """
+    Authentifie la signature RSA d'un APKINDEX.tar.gz déjà téléchargé, en
+    extrait le fichier APKINDEX et le parse. Retourne la liste des paquets.
+    """
     sig_ok, sig_msg = _verify_apkindex_signature(gz_data)
     if not sig_ok:
         raise ValueError(f"Vérification de signature APKINDEX échouée : {sig_msg}")
@@ -399,14 +405,75 @@ def _download_and_parse(apkindex_url: str, source: dict) -> list[dict]:
     return _parse_apkindex(raw_text, source)
 
 
-def sync_source(source: dict) -> dict:
+def _download_and_parse(apkindex_url: str, source: dict) -> list[dict]:
+    """Télécharge, authentifie et parse un APKINDEX.tar.gz en une passe."""
+    return _verify_and_parse(_fetch_apkindex(apkindex_url), source)
+
+
+def _indexed_pkg_count(source_id: str) -> int:
+    """Nombre de paquets APK actuellement indexés pour cette source."""
+    try:
+        with db_conn() as conn:
+            return conn.execute(
+                text("SELECT COUNT(*) FROM apk_packages WHERE source_id = :sid"),
+                {"sid": source_id},
+            ).scalar() or 0
+    except Exception:
+        return 0
+
+
+def _touch_sync_status(source_id: str, label: str, pkg_count: int) -> None:
+    """Rafraîchit last_sync sans réécrire l'index (source inchangée)."""
+    with db_conn() as conn:
+        conn.execute(text("""
+            INSERT INTO apk_sync_status (source_id, label, last_sync, pkg_count, status, error)
+            VALUES (:source_id, :label, :last_sync, :pkg_count, 'ok', NULL)
+            ON CONFLICT (source_id) DO UPDATE SET
+                label = EXCLUDED.label,
+                last_sync = EXCLUDED.last_sync,
+                pkg_count = EXCLUDED.pkg_count,
+                status = 'ok',
+                error = NULL
+        """), {
+            "source_id": source_id,
+            "label": label,
+            "last_sync": datetime.now(timezone.utc).isoformat(),
+            "pkg_count": pkg_count,
+        })
+
+
+def sync_source(source: dict, force: bool = False) -> dict:
     """
     Télécharge et indexe APKINDEX.tar.gz pour une source Alpine donnée.
+
+    Alpine ne publie aucun manifeste portant le hash de l'index (contrairement
+    à InRelease côté APT et repomd.xml côté RPM) : l'empreinte est donc le
+    SHA-256 de l'archive téléchargée. Le téléchargement a lieu dans tous les
+    cas mais une empreinte identique évite la vérification RSA (subprocess openssl),
+    l'extraction tar, le parsing et la réécriture complète de la table.
     """
     source_id = source["id"]
 
     try:
-        packages = _download_and_parse(source["apkindex_url"], source)
+        gz_data = _fetch_apkindex(source["apkindex_url"])
+        fingerprint = hashlib.sha256(gz_data).hexdigest()
+
+        if not force and index_state.is_unchanged(source_id, fingerprint):
+            indexed = _indexed_pkg_count(source_id)
+            if indexed > 0:
+                _touch_sync_status(source_id, source["label"], indexed)
+                logger.info(
+                    "[package_index_apk] %s: index amont inchangé (SHA256 %s…) : sync sautée",
+                    source_id, fingerprint[:16],
+                )
+                return {
+                    "source_id": source_id,
+                    "label": source["label"],
+                    "status": "skipped",
+                    "pkg_count": indexed,
+                }
+
+        packages = _verify_and_parse(gz_data, source)
 
         _defaults = {
             "arch": None, "description": None, "depends": None, "provides": None,
@@ -416,6 +483,11 @@ def sync_source(source: dict) -> dict:
         for pkg in packages:
             for k, v in _defaults.items():
                 pkg.setdefault(k, v)
+
+        # Effacée AVANT la réécriture : une interruption entre le DELETE et la
+        # fin des INSERT ne doit jamais laisser une empreinte qui prétend que
+        # la base contient un catalogue complet.
+        index_state.clear(source_id)
 
         with db_conn() as conn:
             conn.execute(text("DELETE FROM apk_packages WHERE source_id = :source_id"), {"source_id": source_id})
@@ -443,6 +515,8 @@ def sync_source(source: dict) -> dict:
                 "last_sync": datetime.now(timezone.utc).isoformat(),
                 "pkg_count": len(packages),
             })
+
+        index_state.remember(source_id, fingerprint)
 
         return {
             "source_id": source_id,

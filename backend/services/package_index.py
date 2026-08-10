@@ -9,7 +9,9 @@ Dispatcher package_index — sélectionne l'implémentation selon REPO_FORMAT.
 
 Interface publique commune :
   DEFAULT_SOURCES     — liste de dicts décrivant les sources upstream
-  sync_source(source) — synchronise une source dans l'index SQLite
+  sync_source(source, force=False) — synchronise une source dans l'index ;
+                        saute le travail si l'index amont est inchangé
+                        (services/index_state.py) sauf si force=True
   sync_all()          — synchronise toutes les sources
   get_sync_status()   — statut de synchronisation de chaque source
   search_packages(q)  — recherche par nom/description/résumé
@@ -69,13 +71,13 @@ if _REPO_FORMAT == "all":
     # Sources fusionnées : APT en premier, RPM en second, APK en troisième
     DEFAULT_SOURCES: list[dict] = list(_APT_SOURCES) + list(_RPM_SOURCES) + list(_APK_SOURCES)
 
-    def sync_source(source: dict, stop_event=None) -> dict:           # noqa: E302
+    def sync_source(source: dict, stop_event=None, force: bool = False) -> dict:  # noqa: E302
         """Route vers APT, RPM ou APK selon la clé discriminante."""
         if "apkindex_url" in source:
-            return _apk_sync_source(source)
+            return _apk_sync_source(source, force=force)
         if "repomd_url" in source:
-            return _rpm_sync_source(source, stop_event=stop_event)
-        return _apt_sync_source(source)
+            return _rpm_sync_source(source, stop_event=stop_event, force=force)
+        return _apt_sync_source(source, force=force)
 
     def sync_all() -> list[dict]:                                     # noqa: E302
         """Synchronise toutes les sources APT puis RPM puis APK."""
@@ -157,11 +159,11 @@ elif _REPO_FORMAT == "both":
     # Sources fusionnées — APT en premier, RPM en second
     DEFAULT_SOURCES: list[dict] = list(_APT_SOURCES) + list(_RPM_SOURCES)
 
-    def sync_source(source: dict, stop_event=None) -> dict:           # noqa: E302
+    def sync_source(source: dict, stop_event=None, force: bool = False) -> dict:  # noqa: E302
         """Route vers APT ou RPM selon la présence de 'repomd_url' (clé RPM)."""
         if "repomd_url" in source:
-            return _rpm_sync_source(source, stop_event=stop_event)
-        return _apt_sync_source(source)
+            return _rpm_sync_source(source, stop_event=stop_event, force=force)
+        return _apt_sync_source(source, force=force)
 
     def sync_all() -> list[dict]:                                     # noqa: E302
         """Synchronise toutes les sources APT puis RPM."""

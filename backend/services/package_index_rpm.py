@@ -30,6 +30,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from db.engine import db_conn
+from services import index_state
 from services.http_retry import fetch_url
 
 logger = logging.getLogger("package_index_rpm")
@@ -962,17 +963,33 @@ def _stream_download_and_parse(url: str, source_id: str, distro: str = "",
 
 # ─── Synchronisation d'une source ────────────────────────────────────────────
 
-def sync_source(source: dict, stop_event=None) -> dict:
+def _indexed_pkg_count(source_id: str) -> int:
+    """Nombre de paquets actuellement indexés pour cette source."""
+    try:
+        with db_conn() as conn:
+            return conn.execute(
+                text("SELECT COUNT(*) FROM packages WHERE source_id = :sid"),
+                {"sid": source_id},
+            ).scalar() or 0
+    except Exception:
+        return 0
+
+
+def sync_source(source: dict, stop_event=None, force: bool = False) -> dict:
     """
     Synchronise une source RPM dans l'index PostgreSQL.
 
-    stop_event : threading.Event optionnel — si set(), annule l'opération en cours.
+    stop_event : threading.Event optionnel si set(), annule l'opération en cours.
+    force      : resynchronise même si l'index amont est inchangé.
 
     Processus :
       1. Télécharger repomd.xml, l'authentifier via repomd.xml.asc (quand publié)
       2. Extraire l'URL + SHA-256 de primary.xml depuis repomd.xml
-      3. Télécharger en streaming + décompresser à la volée
-      4. Parser avec iterparse ; commits rapides par batch
+      3. Si ce SHA-256 est celui déjà ingéré, s'arrêter là, primary.xml pèse
+         jusqu'à 600 Mo décompressés et le re-télécharger pour réécrire un
+         catalogue identique était l'essentiel du coût d'un cycle de sync
+      4. Sinon : télécharger en streaming + décompresser à la volée
+      5. Parser avec iterparse ; commits rapides par batch
     """
     source_id  = source["id"]
     repomd_url = source.get("repomd_url", "")
@@ -1001,6 +1018,29 @@ def sync_source(source: dict, stop_event=None) -> dict:
         _log_sync(source_id, "error", 0, err)
         return {"source_id": source_id, "status": "error", "error": err}
 
+    # Skip si primary.xml est identique à celui déjà ingéré. Le garde-fou sur
+    # le comptage évite de sauter une source dont la table a été vidée par
+    # ailleurs (purge manuelle, restauration partielle).
+    if not force and index_state.is_unchanged(source_id, primary_sha256):
+        indexed = _indexed_pkg_count(source_id)
+        if indexed > 0:
+            _log_sync(source_id, "ok", indexed, None)
+            logger.info(
+                "[package_index_rpm] %s: index amont inchangé (primary.xml %s…) : sync sautée",
+                source_id, (primary_sha256 or "")[:16],
+            )
+            return {
+                "source_id": source_id,
+                "status":    "skipped",
+                "pkg_count": indexed,
+                "label":     source.get("label", source_id),
+            }
+
+    # Effacée AVANT la réécriture : _stream_download_and_parse() committe son
+    # DELETE dès le premier batch, une interruption ensuite ne doit jamais
+    # laisser une empreinte qui prétend que la base contient un catalogue complet.
+    index_state.clear(source_id)
+
     pkg_count = _stream_download_and_parse(
         primary_url, source_id,
         distro=source.get("distro", ""),
@@ -1022,6 +1062,7 @@ def sync_source(source: dict, stop_event=None) -> dict:
         return {"source_id": source_id, "status": "error", "error": err}
 
     _log_sync(source_id, "ok", pkg_count, None)
+    index_state.remember(source_id, primary_sha256)
 
     return {
         "source_id": source_id,
