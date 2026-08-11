@@ -41,6 +41,7 @@ from services.package_index import (
 from services.package_index import (
     get_package_info as index_get_info,
 )
+from services.path_safety import PathTraversalError, safe_path_join
 from services.rate_limits import make_role_limit
 from services.security_sync import SECURITY_SOURCES, run_security_sync
 from services.settings import get_settings, is_source_enabled, update_settings
@@ -116,6 +117,28 @@ def resolve(
 
 # ─── Import ───────────────────────────────────────────────────────────────────
 
+def _validate_import_group(group: str | None) -> None:
+    """Rejette un nom de groupe qui sortirait de IMPORTS_DIR.
+
+    `group` sert de composant de chemin dans
+    services/importer_apt.py:_import_one_locked() (répertoire du groupe
+    d'import). Contrôlé ici, avant l'ouverture du flux SSE : une HTTPException
+    levée depuis le générateur d'une StreamingResponse n'atteindrait plus le
+    client, le statut étant déjà envoyé.
+
+    On délègue à safe_path_join() plutôt qu'à une regex : celle du endpoint
+    frère DELETE /import/groups/{group_name} (^[\\w.\\-+]+$) accepte "." et
+    ".." puisque le point y est littéral. Une valeur vide ou None garde le
+    repli sur le nom du paquet, fait côté service.
+    """
+    if not group:
+        return
+    try:
+        safe_path_join(IMPORTS_DIR, group)
+    except PathTraversalError:
+        raise HTTPException(status_code=400, detail="Nom de groupe invalide")
+
+
 class ImportRequest(BaseModel):
     package: str
     group: str | None = None         # groupe d'import cible (défaut = nom du paquet)
@@ -143,6 +166,8 @@ def fetch_package(
     les valide et les ajoute au repo.
     Retourne un stream Server-Sent Events pour les logs en temps réel.
     """
+    _validate_import_group(body.group)
+
     audit_log("IMPORT", current_user, "START",
               package=body.package,
               detail="Import depuis internet lancé")
@@ -178,6 +203,8 @@ def batch_import(
     """
     Import par lot : stream SSE pour une liste de paquets.
     """
+    _validate_import_group(body.group)
+
     if not body.packages:
         raise HTTPException(status_code=400, detail="Liste de paquets vide")
 
