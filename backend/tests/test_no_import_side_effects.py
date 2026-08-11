@@ -22,6 +22,7 @@ Rôle   : garde-fou contre la régression qui a cassé la CI (7 erreurs de
 Dépend : ast, pathlib (aucune dépendance applicative)
 """
 import ast
+import uuid
 from pathlib import Path
 
 import pytest
@@ -111,3 +112,78 @@ def test_guard_allows_a_mkdir_inside_a_function():
         "    (POOL / name).write_text('x')\n"
     )
     assert _module_level_fs_calls(ast.parse(source)) == []
+
+
+# ── Contrepartie du garde-fou statique ───────────────────────────────────────
+#
+# Supprimer le mkdir d'import n'est correct que si l'écriture le recrée. Le
+# test statique ci-dessus ne le prouve pas : il interdit le mkdir à l'import,
+# il ne vérifie pas que le writer en fait un. Ces tests-ci pointent chaque
+# répertoire sur un chemin ABSENT (deux niveaux non créés) puis appellent le
+# writer, ce qui échouerait en FileNotFoundError sans le mkdir différé.
+
+
+class TestWritersCreateTheirOwnDirectory:
+    def test_audit_log_creates_audit_dir(self, tmp_path, monkeypatch):
+        import services.audit as mod
+
+        target = tmp_path / "absent" / "audit"
+        monkeypatch.setattr(mod, "AUDIT_DIR", target)
+        mod.log("UPLOAD", "alice", "SUCCESS", package="nmap")
+
+        assert list(target.glob("*.jsonl"))
+
+    def test_save_index_creates_parent_dir(self, tmp_path, monkeypatch):
+        import services.indexer as mod
+
+        target = tmp_path / "absent" / "manifests" / "index.json"
+        monkeypatch.setattr(mod, "INDEX_PATH", target)
+        mod._save_index({"version": "1.0", "packages": {}})
+
+        assert target.exists()
+
+    def test_create_pending_creates_pending_dir(self, tmp_path, monkeypatch):
+        import services.pending_promotions as mod
+
+        target = tmp_path / "absent" / "pending"
+        monkeypatch.setattr(mod, "PENDING_DIR", target)
+        record = mod.create_pending(
+            name="nmap", version="7.94", from_dist="staging", to_dist="stable",
+            requested_by="alice", policy_verdict={"allowed": True},
+        )
+
+        assert (target / f"{record['id']}.json").exists()
+
+    def test_cve_cache_write_creates_security_dir(self, tmp_path, monkeypatch):
+        """SECURITY_CACHE_DIR n'a pas de mkdir dédié : _save_json() est l'unique
+        point d'écriture du module (refresh_kev + _save_epss_cache y passent) et
+        crée lui-même path.parent."""
+        import services.cve_enrichment as mod
+
+        target = tmp_path / "absent" / "security" / "kev_cache.json"
+        monkeypatch.setattr(mod, "KEV_CACHE_PATH", target)
+        mod._save_json(mod.KEV_CACHE_PATH, {"cve_ids": ["CVE-2024-0001"]})
+
+        assert target.exists()
+
+    def test_save_component_sbom_creates_sbom_dir(self, tmp_path, monkeypatch):
+        import services.component_sbom as mod
+
+        target = tmp_path / "absent" / "sboms"
+        monkeypatch.setattr(mod, "SBOM_DIR", target)
+        mod.save_component_sbom("curl", "8.5.0-1", "amd64", {"components": []})
+
+        assert mod.load_component_sbom("curl", "8.5.0-1", "amd64") == {"components": []}
+
+    def test_update_pending_cannot_write_without_the_directory(self, tmp_path, monkeypatch):
+        """update_pending() est le seul autre writer de PENDING_DIR et n'a pas
+        de mkdir : il sort en None avant l'écriture si le fichier n'existe pas
+        (donc si le répertoire n'existe pas). Invariant vérifié ici plutôt que
+        supposé."""
+        import services.pending_promotions as mod
+
+        target = tmp_path / "absent" / "pending"
+        monkeypatch.setattr(mod, "PENDING_DIR", target)
+
+        assert mod.update_pending(str(uuid.uuid4()), status="approved") is None
+        assert not target.exists()
