@@ -29,9 +29,12 @@ Rôle   : le champ `group` de ImportRequest/BatchImportRequest
              l'ouverture du flux SSE plutôt qu'un 200 contenant une erreur.
 
          Le garde s'appuie sur services/path_safety.py:safe_path_join() et non
-         sur une regex : celle du endpoint frère
-         DELETE /import/groups/{group_name} (^[\\w.\\-+]+$) accepte "." et ".."
-         puisque le point est littéral dans la classe de caractères.
+         sur une regex : ^[\\w.\\-+]+$, la forme qu'employait le endpoint frère
+         DELETE /import/groups/{group_name} jusqu'à son propre correctif,
+         accepte "." et ".." puisque le point est littéral dans la classe de
+         caractères. Ce frère délègue désormais au même safe_path_join(), avec
+         un refus supplémentaire de "." que l'opération de suppression impose
+         (voir test_import_group_delete_traversal.py).
 
 Dépend : pytest, unittest.mock.patch — aucun subprocess/réseau réel.
 """
@@ -142,8 +145,9 @@ class TestImportOneGroupSink:
     ])
     def test_traversal_relative_is_rejected(self, tmp_path, group):
         """Coeur du correctif : aucun `group` relatif ne doit sortir de
-        IMPORTS_DIR. Le cas ".." est celui que la regex ^[\\w.\\-+]+$ du
-        endpoint frère accepterait à tort."""
+        IMPORTS_DIR. Le cas ".." est celui que la regex ^[\\w.\\-+]+$, employée
+        ici puis dans le endpoint frère avant leurs correctifs respectifs,
+        acceptait à tort."""
         result, imports_dir, pool_dir, mock_download, mock_subproc = \
             self._run_import(tmp_path, group)
 
