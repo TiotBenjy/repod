@@ -126,10 +126,10 @@ def _validate_import_group(group: str | None) -> None:
     levée depuis le générateur d'une StreamingResponse n'atteindrait plus le
     client, le statut étant déjà envoyé.
 
-    On délègue à safe_path_join() plutôt qu'à une regex : celle du endpoint
-    frère DELETE /import/groups/{group_name} (^[\\w.\\-+]+$) accepte "." et
-    ".." puisque le point y est littéral. Une valeur vide ou None garde le
-    repli sur le nom du paquet, fait côté service.
+    On délègue à safe_path_join() plutôt qu'à une regex : ^[\\w.\\-+]+$, la
+    forme employée ici avant correctif comme dans delete_import_group(),
+    accepte "." et ".." puisque le point y est littéral. Une valeur vide ou
+    None garde le repli sur le nom du paquet, fait côté service.
     """
     if not group:
         return
@@ -991,12 +991,21 @@ def delete_import_group(
     current_user: str = Depends(get_admin_user),
 ):
     """Supprime un groupe d'import (les fichiers dans /repos/imports/{name})."""
-    import re
     import shutil
-    if not re.match(r'^[\w.\-+]+$', group_name):
+
+    try:
+        group_dir = safe_path_join(IMPORTS_DIR, group_name)
+        # safe_path_join accepte « . », qui reste dans la base puisqu'il la
+        # désigne : sans évasion, mais rmtree effacerait tous les groupes.
+        if group_dir == IMPORTS_DIR.resolve():
+            raise PathTraversalError("« . » désigne IMPORTS_DIR lui-même")
+    except PathTraversalError:
         raise HTTPException(status_code=400, detail="Nom de groupe invalide")
-    group_dir = IMPORTS_DIR / group_name
-    if not group_dir.exists():
+
+    # is_dir() et non exists() : ce dernier était vrai pour /repos/imports/..
+    # comme pour un fichier simple, sur lequel rmtree lève NotADirectoryError,
+    # remontée en 500.
+    if not group_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Groupe '{group_name}' introuvable")
     shutil.rmtree(str(group_dir))
     audit_log("IMPORT_GROUP_DELETE", current_user, "SUCCESS", detail=f"Groupe '{group_name}' supprimé")
